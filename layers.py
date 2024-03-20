@@ -2,6 +2,7 @@
 Inspired by,
 * https://github.com/karpathy/nanoGPT/tree/master
 * https://theaisummer.com/einsum-attention/
+* https://arxiv.org/abs/2207.09238
 
 Notes on padding and masking
 * https://github.com/pytorch/pytorch/issues/103749
@@ -9,61 +10,63 @@ Notes on padding and masking
 """
 
 import math
+from typing import Optional
 
 import einops
 from pydantic import BaseModel
+from pydantic import Field
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 
-class MalamoConfig(BaseModel):
-    n_layer: int
-    vocab_size: int
-    d_embed: int
-    num_heads: int
-    max_seq_len: int
-    padding_idx: int
-    dropout: float
-    bias: bool
+class LamoConfig(BaseModel):
+    n_layer: int = Field(gt=0, description="number of layers")
+    n_vocab: int = Field(gt=0, description="number of tokens in vocabulary")
+    n_head: int = Field(gt=0, description="number of attention heads")
+    l_max: int = Field(gt=0, description="maximum sequence length")
+    d_x: int = Field(gt=0, description="embedding size for primary sequence")
+    d_z: int = Field(gt=0, description="embedding size for context sequence")
+    d_attn: int = Field(gt=0, description="embedding size per head for query and key projections")
+    d_mid: int = Field(gt=0, description="embedding size per head for value projection")
+    d_out: int = Field(gt=0, description="embedding size for output")
+    dropout: float = Field(ge=0, description="dropout probability")
+    bias: bool = Field(description="use bias parameters if true")
+    padding_idx: Optional[int] = Field(description="index of padding token")
 
 
 class MultiheadSelfAttention(nn.Module):
 
-    def __init__(self, config: MalamoConfig):
+    def __init__(self, config: LamoConfig):
 
         super().__init__()
-        assert (
-            config.d_embed % config.num_heads == 0
-        ), "d_embed is not divisible by num_heads"
-
         self.config = config
-        self.d_head = config.d_embed // config.num_heads
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.w_qkv = nn.Linear(config.d_embed, 3 * config.d_embed, bias=config.bias)
-        self.w_o = nn.Linear(config.d_embed, config.d_embed, bias=config.bias)
+        self.w_q = nn.Linear(config.d_x, config.n_head * config.d_attn, bias=config.bias)
+        self.w_k = nn.Linear(config.d_z, config.n_head * config.d_attn, bias=config.bias)
+        self.w_v = nn.Linear(config.d_z, config.n_head * config.d_mid, bias=config.bias)
+        self.w_o = nn.Linear(config.n_head * config.d_mid, config.d_out, bias=config.bias)
+        self.output_dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x, attn_mask=None, is_causal=False):
-        """bs: batch_size, sl: sequence length, de: embedding dimension
-        nh: num heads,  dh: head dimension. de = nh * dh
-        """
+    def forward(self, x, z, attn_mask=None, is_causal=False):
 
-        bs, sl, de = x.shape
-        assert de == self.config.d_embed
-        qkv = self.w_qkv(x)
-        assert qkv.shape == (bs, sl, 3 * de)
-        qq, kk, vv = tuple(
-            einops.rearrange(
-                qkv, "bs sl (k nh dh) -> k bs nh sl dh", k=3, nh=self.config.num_heads
-            )
-        )
+        bs, l_x, d_x = x.shape
+        _, l_z, d_z = z.shape
+
+        assert x.shape[0] == z.shape[0]
+        assert d_x == self.config.d_x
+        assert d_z == self.config.d_z
+
+        qq = einops.rearrange(self.w_q(x), "bs lx (nh da) -> bs nh lx da", nh=self.config.n_head)
+        kk = einops.rearrange(self.w_k(z), "bs lz (nh da) -> bs nh lz da", nh=self.config.n_head)
+        vv = einops.rearrange(self.w_v(z), "bs lz (nh dm) -> bs nh lz dm", nh=self.config.n_head)
+
         dropout_p = self.config.dropout if self.training else 0.0
         y = F.scaled_dot_product_attention(
             qq, kk, vv, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
         )
-        assert y.shape == (bs, self.config.num_heads, sl, self.d_head)
-        y = einops.rearrange(y, "bs nh sl dh -> bs sl (nh dh)")
-        y = self.resid_dropout(self.w_o(y))
+        y = einops.rearrange(y, "bs nh lx dm -> bs lx (nh dm)")
+        y = self.output_dropout(self.w_o(y))
+
         return y
 
 
@@ -71,9 +74,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.w_fc_in = nn.Linear(config.d_embed, 4 * config.d_embed, bias=config.bias)
+        self.w_fc_in = nn.Linear(config.d_x, 4 * config.d_x, bias=config.bias)
         self.gelu = nn.GELU()
-        self.w_fc_out = nn.Linear(4 * config.d_embed, config.d_embed, bias=config.bias)
+        self.w_fc_out = nn.Linear(4 * config.d_x, config.d_x, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -88,28 +91,30 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.layernorm_1 = nn.LayerNorm(config.d_embed, bias=config.bias)
+        self.layernorm_1 = nn.LayerNorm(config.d_x, bias=config.bias)
         self.attn = MultiheadSelfAttention(config)
-        self.layernorm_2 = nn.LayerNorm(config.d_embed, bias=config.bias)
+        self.layernorm_2 = nn.LayerNorm(config.d_x, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x, attn_mask):
-        x = x + self.attn(self.layernorm_1(x), attn_mask)
+
+        x = self.layernorm_1(x)
+        x = x + self.attn(x, x, attn_mask)
         x = x + self.mlp(self.layernorm_2(x))
         return x
 
 
-class Malamo(nn.Module):
+class LamoEncoder(nn.Module):
 
-    def __init__(self, config: MalamoConfig):
+    def __init__(self, config: LamoConfig):
 
         super().__init__()
         self.config = config
 
-        wte = nn.Embedding(
-            config.vocab_size, config.d_embed, padding_idx=config.padding_idx
-        )
-        wpe = nn.Embedding(config.max_seq_len, config.d_embed)
+        assert config.d_x == config.d_z
+
+        wte = nn.Embedding(config.n_vocab, config.d_x, padding_idx=config.padding_idx)
+        wpe = nn.Embedding(config.l_max, config.d_x)
 
         self.encoder = nn.ModuleDict(
             {
@@ -117,10 +122,10 @@ class Malamo(nn.Module):
                 "wpe": wpe,
                 "dropout": nn.Dropout(config.dropout),
                 "blocks": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                "layernorm_f": nn.LayerNorm(config.d_embed, bias=config.bias),
+                "layernorm_f": nn.LayerNorm(config.d_x, bias=config.bias),
             }
         )
-        self.lm_head = nn.Linear(config.d_embed, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.d_x, config.n_vocab, bias=False)
 
         # init all weights
         self.apply(self._init_weights)
@@ -134,18 +139,18 @@ class Malamo(nn.Module):
 
     def forward(self, input_ids, attention_mask, labels=None):
 
-        bs, sl = input_ids.shape
+        bs, l_x = input_ids.shape
 
-        assert attention_mask.shape == (bs, sl)
-        assert sl <= self.config.max_seq_len
+        assert attention_mask.shape == (bs, l_x)
+        assert l_x <= self.config.l_max
 
-        pos = torch.arange(0, sl, dtype=torch.long, device=input_ids.device)
+        pos = torch.arange(0, l_x, dtype=torch.long, device=input_ids.device)
 
-        # attention mask from tokenizer is [bs, sl]
-        # first convert to [bs, sl, sl] by repeating each sequence sl times
-        attn_mask = attention_mask.repeat(1, 1, sl).reshape(bs, sl, sl)
+        # attention mask from tokenizer is [bs, l_x]
+        # first convert to [bs, l_x, l_x] by repeating each sequence l_x times
+        attn_mask = attention_mask.repeat(1, 1, l_x).reshape(bs, l_x, l_x)
 
-        # now make boolean and expand so it is broadcastable to [bs, nh, sl, sl]
+        # now make boolean and expand so it is broadcastable to [bs, nh, l_x, l_x]
         attn_mask = attn_mask == 1
         attn_mask = attn_mask[:, None, :, :]
 
@@ -193,3 +198,52 @@ class Malamo(nn.Module):
         if non_embedding:
             n_params -= self.encoder.wte.weight.numel()
         return n_params
+
+
+if __name__ == "__main__":
+
+    d_e = 768
+    n_head = 12
+    d_mid = d_e // n_head
+    d_attn = d_e // n_head
+
+    config_encoder = LamoConfig(
+        n_layer=12,
+        n_vocab=2**15,
+        n_head=n_head,
+        l_max=512,
+        d_x=d_e,
+        d_z=d_e,
+        d_attn=d_e,
+        d_mid=d_mid,
+        d_out=d_e,
+        padding_idx=0,
+        dropout=0.0,
+        bias=False,
+    )
+
+    config = LamoConfig(
+        n_layer=12,
+        n_vocab=2**15,
+        n_head=n_head,
+        l_max=512,
+        d_x=n_head * 2,
+        d_z=n_head * 3,
+        d_attn=n_head * 4,
+        d_mid=n_head * 5,
+        d_out=n_head * 6,
+        padding_idx=0,
+        dropout=0.0,
+        bias=False,
+    )
+
+    mhsa = MultiheadSelfAttention(config)
+
+    b_s = 3
+    l_x = config.l_max
+    l_z = config.l_max
+    x = torch.rand(b_s, l_x, config.d_x)
+    z = torch.rand(b_s, l_z, config.d_z)
+    out = mhsa(x, z)
+
+    lamo = LamoEncoder(config_encoder)
