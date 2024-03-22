@@ -1,4 +1,4 @@
-# malamo
+# lamo
 
 ## Inspiration
 
