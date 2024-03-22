@@ -3,39 +3,52 @@ Inspired by,
 * https://github.com/karpathy/nanoGPT/tree/master
 * https://theaisummer.com/einsum-attention/
 * https://arxiv.org/abs/2207.09238
+* https://www.datacamp.com/tutorial/building-a-transformer-with-py-torch
 
 Notes on padding and masking
 * https://github.com/pytorch/pytorch/issues/103749
 
-"""
 
+TODO: tie embedding weights
+
+"""
+from enum import Enum
 import math
 from typing import Optional
 
 import einops
 from pydantic import BaseModel
 from pydantic import Field
+import rich
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 
+class PosEmbType(str, Enum):
+    none = "none"
+    learned = "learned"
+
+
 class LamoConfig(BaseModel):
-    n_layer: int = Field(gt=0, description="number of layers")
     n_vocab: int = Field(gt=0, description="number of tokens in vocabulary")
-    n_head: int = Field(gt=0, description="number of attention heads")
-    l_max: int = Field(gt=0, description="maximum sequence length")
-    d_x: int = Field(gt=0, description="embedding size for primary sequence")
-    d_z: int = Field(gt=0, description="embedding size for context sequence")
-    d_attn: int = Field(gt=0, description="embedding size per head for query and key projections")
-    d_mid: int = Field(gt=0, description="embedding size per head for value projection")
-    d_out: int = Field(gt=0, description="embedding size for output")
-    dropout: float = Field(ge=0, description="dropout probability")
-    bias: bool = Field(description="use bias parameters if true")
     padding_idx: Optional[int] = Field(description="index of padding token")
+    n_layer: int = Field(gt=0, default=12, description="number of layers")
+    n_head: int = Field(gt=0, default=12, description="number of attention heads")
+    l_max: int = Field(gt=0, default=512, description="maximum sequence length")
+    d_x: int = Field(gt=0, default=768, description="embedding size for primary sequence")
+    d_z: int = Field(gt=0, default=768, description="embedding size for context sequence")
+    d_attn: int = Field(gt=0, default=64, description="embedding size per head for query and key projections")
+    d_mid: int = Field(gt=0, default=64, description="embedding size per head for value projection")
+    d_out: int = Field(gt=0, default=768, description="embedding size for output")
+    fc_mult: int = Field(gt=0, default=4, description="fully connected layer multiplier")
+    pre_layernorm: bool = Field(default=True, description="pre layernorm if true else post layernorm")
+    dropout: float = Field(ge=0, default=0.0, description="dropout probability")
+    bias: bool = Field(default=False, description="use bias parameters if true")
+    pos_emb_type: PosEmbType = Field(default="learned", description="type of position embeddings")
 
 
-class MultiheadSelfAttention(nn.Module):
+class MultiheadAttention(nn.Module):
 
     def __init__(self, config: LamoConfig):
 
@@ -49,12 +62,16 @@ class MultiheadSelfAttention(nn.Module):
 
     def forward(self, x, z, attn_mask=None, is_causal=False):
 
-        bs, l_x, d_x = x.shape
-        _, l_z, d_z = z.shape
+        bs, lx, dx = x.shape
+        bsz, lz, dz = z.shape
 
-        assert x.shape[0] == z.shape[0]
-        assert d_x == self.config.d_x
-        assert d_z == self.config.d_z
+        assert bs == bsz
+        assert dx == self.config.d_x
+        assert dz == self.config.d_z
+        if attn_mask is not None:
+            amask_check_1 = attn_mask.shape == (bs, 1, lx, lz)
+            amask_check_2 = attn_mask.shape == (bs, self.config.n_head, lx, lz)
+            assert amask_check_1 or amask_check_2
 
         qq = einops.rearrange(self.w_q(x), "bs lx (nh da) -> bs nh lx da", nh=self.config.n_head)
         kk = einops.rearrange(self.w_k(z), "bs lz (nh da) -> bs nh lz da", nh=self.config.n_head)
@@ -74,9 +91,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.w_fc_in = nn.Linear(config.d_x, 4 * config.d_x, bias=config.bias)
+        self.w_fc_in = nn.Linear(config.d_x, config.fc_mult * config.d_x, bias=config.bias)
         self.gelu = nn.GELU()
-        self.w_fc_out = nn.Linear(4 * config.d_x, config.d_x, bias=config.bias)
+        self.w_fc_out = nn.Linear(config.fc_mult * config.d_x, config.d_x, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -91,16 +108,20 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.layernorm_1 = nn.LayerNorm(config.d_x, bias=config.bias)
-        self.attn = MultiheadSelfAttention(config)
-        self.layernorm_2 = nn.LayerNorm(config.d_x, bias=config.bias)
+        self.config = config
+        self.ln_1 = nn.LayerNorm(config.d_x, bias=config.bias)
+        self.attn = MultiheadAttention(config)
+        self.ln_2 = nn.LayerNorm(config.d_x, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, attn_mask):
-
-        x = self.layernorm_1(x)
-        x = x + self.attn(x, x, attn_mask)
-        x = x + self.mlp(self.layernorm_2(x))
+    def forward(self, x, attn_mask=None, is_causal=False):
+        if self.config.pre_layernorm:
+            ln1 = self.ln_1(x)
+            x = x + self.attn(ln1, ln1, attn_mask=attn_mask, is_causal=is_causal)
+            x = x + self.mlp(self.ln_2(x))
+        else:
+            x = self.ln_1(x + self.attn(x, x, attn_mask))
+            x = self.ln_2(x + self.mlp(x))
         return x
 
 
@@ -110,73 +131,67 @@ class LamoEncoder(nn.Module):
 
         super().__init__()
         self.config = config
-
         assert config.d_x == config.d_z
 
         wte = nn.Embedding(config.n_vocab, config.d_x, padding_idx=config.padding_idx)
-        wpe = nn.Embedding(config.l_max, config.d_x)
 
-        self.encoder = nn.ModuleDict(
-            {
-                "wte": wte,
-                "wpe": wpe,
-                "dropout": nn.Dropout(config.dropout),
-                "blocks": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                "layernorm_f": nn.LayerNorm(config.d_x, bias=config.bias),
-            }
-        )
+        if config.pos_emb_type == "none":
+            self.encoder = nn.ModuleDict(
+                {
+                    "wte": wte,
+                    "dropout": nn.Dropout(config.dropout),
+                    "blocks": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                    "ln_f": nn.LayerNorm(config.d_x, bias=config.bias),
+                }
+            )
+        elif config.pos_emb_type == "learned":
+            wpe = nn.Embedding(config.l_max, config.d_x)
+            self.encoder = nn.ModuleDict(
+                {
+                    "wte": wte,
+                    "wpe": wpe,
+                    "dropout": nn.Dropout(config.dropout),
+                    "blocks": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                    "ln_f": nn.LayerNorm(config.d_x, bias=config.bias),
+                }
+            )
+
         self.lm_head = nn.Linear(config.d_x, config.n_vocab, bias=False)
-
-        # init all weights
         self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith("w_o.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
-        # report number of parameters
-        print("number of parameters: %.4fM" % (self.get_num_params() / 1e6,))
 
-    def forward(self, input_ids, attention_mask, labels=None):
+    def forward(self, input_ids, attention_mask):
 
         bs, l_x = input_ids.shape
-
         assert attention_mask.shape == (bs, l_x)
         assert l_x <= self.config.l_max
 
-        pos = torch.arange(0, l_x, dtype=torch.long, device=input_ids.device)
-
-        # attention mask from tokenizer is [bs, l_x]
-        # first convert to [bs, l_x, l_x] by repeating each sequence l_x times
+        # convert to [bs, l_x, l_x] by repeating each sequence l_x times
+        # then make boolean and expand so it is broadcastable to [bs, nh, l_x, l_x]
         attn_mask = attention_mask.repeat(1, 1, l_x).reshape(bs, l_x, l_x)
-
-        # now make boolean and expand so it is broadcastable to [bs, nh, l_x, l_x]
         attn_mask = attn_mask == 1
         attn_mask = attn_mask[:, None, :, :]
 
         tok_emb = self.encoder.wte(input_ids)
-        pos_emb = self.encoder.wpe(pos)
-        x = self.encoder.dropout(tok_emb + pos_emb)
+        if self.config.pos_emb_type == "none":
+            emb = tok_emb
+        elif self.config.pos_emb_type == "learned":
+            pos = torch.arange(0, l_x, dtype=torch.long, device=input_ids.device)
+            pos_emb = self.encoder.wpe(pos)
+            emb = tok_emb + pos_emb
+
+        x = self.encoder.dropout(emb)
         for block in self.encoder.blocks:
             x = block(x, attn_mask)
-        x = self.encoder.layernorm_f(x)
+        x = self.encoder.ln_f(x)
         logits = self.lm_head(x)
 
-        if labels is None:
-            loss = None
-        else:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
-
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
             "attn_mask": attn_mask,
-            "tok_emb": tok_emb,
-            "pos_emb": pos_emb,
-            "x": x,
             "logits": logits,
-            "labels": labels,
-            "loss": loss,
         }
 
     def _init_weights(self, module):
@@ -187,16 +202,8 @@ class LamoEncoder(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def get_num_params(self, non_embedding=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
+    def get_num_params(self):
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.encoder.wte.weight.numel()
         return n_params
 
 
@@ -206,17 +213,22 @@ if __name__ == "__main__":
     n_head = 12
     d_mid = d_e // n_head
     d_attn = d_e // n_head
+    fc_mult = 4
+    n_vocab = 2**15
+    pre_layernorm = True
 
     config_encoder = LamoConfig(
         n_layer=12,
-        n_vocab=2**15,
+        n_vocab=n_vocab,
         n_head=n_head,
         l_max=512,
         d_x=d_e,
         d_z=d_e,
-        d_attn=d_e,
+        d_attn=d_attn,
         d_mid=d_mid,
         d_out=d_e,
+        fc_mult=fc_mult,
+        pre_layernorm=pre_layernorm,
         padding_idx=0,
         dropout=0.0,
         bias=False,
@@ -224,7 +236,7 @@ if __name__ == "__main__":
 
     config = LamoConfig(
         n_layer=12,
-        n_vocab=2**15,
+        n_vocab=n_vocab,
         n_head=n_head,
         l_max=512,
         d_x=n_head * 2,
@@ -232,18 +244,24 @@ if __name__ == "__main__":
         d_attn=n_head * 4,
         d_mid=n_head * 5,
         d_out=n_head * 6,
+        fc_mult=fc_mult,
+        pre_layernorm=pre_layernorm,
         padding_idx=0,
         dropout=0.0,
         bias=False,
     )
 
-    mhsa = MultiheadSelfAttention(config)
+    mha = MultiheadAttention(config)
 
     b_s = 3
     l_x = config.l_max
     l_z = config.l_max
     x = torch.rand(b_s, l_x, config.d_x)
     z = torch.rand(b_s, l_z, config.d_z)
-    out = mhsa(x, z)
+    mha_out = mha(x, z)
 
+    input_ids = torch.randint(0, n_vocab, size=(b_s, l_x))
+    attention_mask = torch.ones_like(input_ids)
     lamo = LamoEncoder(config_encoder)
+    rich.print("number of parameters: %.4fM" % (lamo.get_num_params() / 1e6,))
+    lamo_out = lamo(input_ids, attention_mask)

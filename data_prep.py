@@ -38,7 +38,7 @@ def chunk_samples(samples):
 
 if __name__ == "__main__":
 
-    block_size = 512
+    block_size = 2048
     tokenizer_name = "google-bert/bert-base-uncased"
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     tokenizer.model_max_length = block_size
