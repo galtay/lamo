@@ -87,8 +87,7 @@ class MultiheadAttention(nn.Module):
         self.w_qkv = nn.Linear(config.d_e, 3 * config.d_e, bias=config.bias)
         self.w_o = nn.Linear(config.d_e, config.d_e, bias=config.bias)
         self.output_dropout = nn.Dropout(config.dropout)
-        if config.pos_type =
-        = "alibi":
+        if config.pos_type == "alibi":
             self.alibi_slopes = torch.tensor(get_alibi_slopes(config.n_head))
         else:
             self.alibi_slopes = None

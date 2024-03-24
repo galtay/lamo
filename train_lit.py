@@ -14,6 +14,11 @@ seed = 8272
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 
+batch_size = 16
+learning_rate = 5e-5
+weight_decay = 0.01
+l_max = 2048
+
 
 # RTX 3090 bf16
 config = config_mod.distilbert_base_config
@@ -22,11 +27,10 @@ config.attn_impl = "flash_varlen_qkvpacked"
 config.pos_type = "alibi"
 #config.pos_type = "learned"
 #config.pos_type = "none"
+config.l_max = l_max
 rich.print(config)
 
-batch_size = 32
-learning_rate = 5e-5
-weight_decay = 0.01
+
 torch.set_float32_matmul_precision("high")
 wandb_logger = WandbLogger(project="lamo")
 
@@ -58,7 +62,7 @@ class LitLamo(L.LightningModule):
 
 
 lit_lamo = LitLamo(config, learning_rate, weight_decay)
-dataloaders = data_mod.get_dataloaders(batch_size, batch_size, num_workers=2)
+dataloaders = data_mod.get_dataloaders(batch_size, batch_size, l_max, num_workers=2)
 trainer = L.Trainer(
     limit_train_batches=512,
     max_epochs=1,

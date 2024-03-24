@@ -5,13 +5,14 @@ from transformers import DataCollatorForLanguageModeling
 
 
 def get_dataloaders(
-    train_batch_size, val_batch_size, mlm_probability=0.15, num_workers=1
+    train_batch_size, val_batch_size, max_seq_len, mlm_probability=0.15, num_workers=1
 ):
 
+    assert max_seq_len in (512, 1024, 2048)
     tokenizer_name = "google-bert/bert-base-uncased"
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-    dsd = load_dataset("hyperdemocracy/usc-llm-tokens-bert-base-uncased-512")
+    dsd = load_dataset(f"hyperdemocracy/usc-llm-tokens-bert-base-uncased-{max_seq_len}")
     dsd.set_format("torch")
     collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer, mlm=True, mlm_probability=mlm_probability
