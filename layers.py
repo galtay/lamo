@@ -32,20 +32,20 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
-def get_alibi_slopes(nheads: int):
+def get_alibi_slopes(n_head: int):
 
-    def get_slopes_power_of_2(nheads: int):
-        start = 2 ** (-(2 ** -(math.log2(nheads) - 3)))
+    def get_slopes_power_of_2(n_head: int):
+        start = 2 ** (-(2 ** -(math.log2(n_head) - 3)))
         ratio = start
-        return [start * ratio**i for i in range(nheads)]
+        return [start * ratio**i for i in range(n_head)]
 
-    if math.log2(nheads).is_integer():
-        return get_slopes_power_of_2(nheads)
+    if math.log2(n_head).is_integer():
+        return get_slopes_power_of_2(n_head)
     else:
-        closest_power_of_2 = 2 ** math.floor(math.log2(nheads))
+        closest_power_of_2 = 2 ** math.floor(math.log2(n_head))
         return (
             get_slopes_power_of_2(closest_power_of_2)
-            + get_alibi_slopes(2 * closest_power_of_2)[0::2][: nheads - closest_power_of_2]
+            + get_alibi_slopes(2 * closest_power_of_2)[0::2][: n_head - closest_power_of_2]
         )
 
 
@@ -87,7 +87,8 @@ class MultiheadAttention(nn.Module):
         self.w_qkv = nn.Linear(config.d_e, 3 * config.d_e, bias=config.bias)
         self.w_o = nn.Linear(config.d_e, config.d_e, bias=config.bias)
         self.output_dropout = nn.Dropout(config.dropout)
-        if config.pos_type == "alibi":
+        if config.pos_type =
+        = "alibi":
             self.alibi_slopes = torch.tensor(get_alibi_slopes(config.n_head))
         else:
             self.alibi_slopes = None
@@ -251,23 +252,23 @@ class LamoEncoder(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attn_mask=None, is_causal=False):
 
-        bs, l_x = input_ids.shape
-        assert attention_mask.shape == (bs, l_x)
-        assert l_x <= self.config.l_max
+        bs, lx = input_ids.shape
+        assert attn_mask.shape == (bs, lx)
+        assert lx <= self.config.l_max
 
         tok_emb = self.encoder.wte(input_ids)
         if self.config.pos_type in ("none", "alibi"):
             emb = tok_emb
         elif self.config.pos_type == "learned":
-            pos = torch.arange(0, l_x, dtype=torch.long, device=input_ids.device)
+            pos = torch.arange(0, lx, dtype=torch.long, device=input_ids.device)
             pos_emb = self.encoder.wpe(pos)
             emb = tok_emb + pos_emb
 
         x = self.encoder.dropout(emb)
         for block in self.encoder.blocks:
-            x = block(x, attention_mask)
+            x = block(x, attn_mask=attn_mask, is_causal=is_causal)
         x = self.encoder.ln_f(x)
         logits = self.lm_head(x)
 
