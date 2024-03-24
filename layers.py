@@ -217,6 +217,8 @@ class LamoEncoder(nn.Module):
 
         super().__init__()
         self.config = config
+        if self.config.attn_impl == "torch_spda" and self.config.pos_type == "alibi":
+            raise NotImplementedError("alibi not implemented for torch_spda")
 
         wte = nn.Embedding(config.n_vocab, config.d_e, padding_idx=config.padding_idx)
 
