@@ -21,6 +21,9 @@ import data_mod
 from layers import LamoEncoder
 
 
+seed = 8272
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
 TORCH_FLOAT32_MATMUL_PRECISIONS = ["highest", "high", "medium"]
 
 
@@ -91,22 +94,6 @@ def run_train_epoch(
     return global_step
 
 
-def get_optimizer(model, learning_rate, weight_decay=0.0):
-    no_decay_params = [
-        p for n, p in model.named_parameters()
-        if n in model.get_no_weight_decay_names()
-    ]
-    decay_params = [
-        p for n, p in model.named_parameters()
-        if n in model.get_weight_decay_names()
-    ]
-    optim_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': no_decay_params, 'weight_decay': 0.0}
-    ]
-    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, fused=True)
-    return optimizer
-
 
 # RTX 3090 bf16
 #config = config_mod.distilbert_base_config
@@ -114,7 +101,7 @@ def get_optimizer(model, learning_rate, weight_decay=0.0):
 
 # RTX 3090 bf16
 config = config_mod.distilbert_base_long_config
-batch_size = 32
+batch_size = 16
 
 # RTX 3090 fp32
 #config = distilbert_base_config
@@ -141,12 +128,14 @@ amp_dtype = torch.bfloat16
 torch.set_float32_matmul_precision(torch_float32_matmul_precision)
 device = torch.device("cuda:0")
 
-dataloaders = data_mod.get_dataloaders(batch_size, batch_size)
+dataloaders = data_mod.get_dataloaders(batch_size, batch_size, config.l_max)
 tokens_per_step = batch_size * config.l_max
 rich.print(f"{tokens_per_step=}")
 
 model = LamoEncoder(config).to(device)
-model = torch.compile(model)
+if config.attn_impl != "flash_varlen_qkvpacked":
+    rich.print("compiling model")
+    model = torch.compile(model)
 optimizer = torch.optim.AdamW(model.get_optimizer_param_groups(weight_decay), lr=learning_rate, fused=True)
 
 wandb.init(
