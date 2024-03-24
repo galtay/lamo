@@ -30,4 +30,8 @@ def get_dataloaders(
         batch_size=val_batch_size,
         num_workers=num_workers,
     )
-    return train_dataloader, val_dataloader
+    return {
+        "train_dl": train_dataloader,
+        "val_dl": val_dataloader,
+        "tokenizer": tokenizer,
+    }
