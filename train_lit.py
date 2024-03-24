@@ -60,8 +60,8 @@ class LitLamo(L.LightningModule):
 lit_lamo = LitLamo(config, learning_rate, weight_decay)
 dataloaders = data_mod.get_dataloaders(batch_size, batch_size, num_workers=2)
 trainer = L.Trainer(
-    limit_train_batches=1000,
-    max_epochs=1,
+#    limit_train_batches=1000,
+    max_epochs=3,
     precision="bf16-mixed",
     devices=2,
     logger=wandb_logger,

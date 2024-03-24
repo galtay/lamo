@@ -58,24 +58,6 @@ class AttnImpl(str, Enum):
     torch_sdpa = "torch_spda"
     flash_varlen_qkvpacked = "flash_varlen_qkvpacked"
 
-class FormalLamoConfig(BaseModel):
-    n_vocab: int = Field(gt=0, description="number of tokens in vocabulary")
-    padding_idx: Optional[int] = Field(description="index of padding token")
-    n_layer: int = Field(gt=0, default=12, description="number of layers")
-    n_head: int = Field(gt=0, default=12, description="number of attention heads")
-    l_max: int = Field(gt=0, default=512, description="maximum sequence length")
-    d_x: int = Field(gt=0, default=768, description="embedding size for primary sequence")
-    d_z: int = Field(gt=0, default=768, description="embedding size for context sequence")
-    d_attn: int = Field(gt=0, default=64, description="embedding size per head for query and key projections")
-    d_mid: int = Field(gt=0, default=64, description="embedding size per head for value projection")
-    d_out: int = Field(gt=0, default=768, description="embedding size for output")
-    fc_mult: int = Field(gt=0, default=4, description="fully connected layer multiplier")
-    pre_layernorm: bool = Field(default=True, description="pre layernorm if true else post layernorm")
-    dropout: float = Field(ge=0, default=0.0, description="dropout probability")
-    bias: bool = Field(default=False, description="use bias parameters if true")
-    pos_type: PosType = Field(default="learned", description="type of position embeddings")
-    tie_weights: bool = Field(default=True, description="tie input embedding and lm head weights")
-    attn_impl: AttnImpl = Field(default="flash_varlen_qkvpacked", description="attention implementation")
 
 class LamoConfig(BaseModel):
     n_vocab: int = Field(gt=0, description="number of tokens in vocabulary")
@@ -88,7 +70,7 @@ class LamoConfig(BaseModel):
     pre_layernorm: bool = Field(default=True, description="pre layernorm if true else post layernorm")
     dropout: float = Field(ge=0, default=0.0, description="dropout probability")
     bias: bool = Field(default=False, description="use bias parameters if true")
-    pos_type: PosType = Field(default="learned", description="type of position embeddings")
+    pos_type: PosType = Field(default="alibi", description="how to handle position information")
     tie_weights: bool = Field(default=True, description="tie input embedding and lm head weights")
     attn_impl: AttnImpl = Field(default="flash_varlen_qkvpacked", description="attention implementation")
 
@@ -189,45 +171,6 @@ class MultiheadAttention(nn.Module):
             y = self.forward_scaled_dot_product_attention(x, attn_mask=attn_mask, is_causal=is_causal)
         else:
             raise ValueError()
-        return y
-
-
-class FormalMultiheadAttention(nn.Module):
-
-    def __init__(self, config: FormalLamoConfig):
-
-        super().__init__()
-        self.config = config
-        self.w_q = nn.Linear(config.d_x, config.n_head * config.d_attn, bias=config.bias)
-        self.w_k = nn.Linear(config.d_z, config.n_head * config.d_attn, bias=config.bias)
-        self.w_v = nn.Linear(config.d_z, config.n_head * config.d_mid, bias=config.bias)
-        self.w_o = nn.Linear(config.n_head * config.d_mid, config.d_out, bias=config.bias)
-        self.output_dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x, z, attn_mask=None, is_causal=False):
-
-        bs, lx, dx = x.shape
-        bsz, lz, dz = z.shape
-
-        assert bs == bsz
-        assert dx == self.config.d_x
-        assert dz == self.config.d_z
-        if attn_mask is not None:
-            amask_check_1 = attn_mask.shape == (bs, 1, lx, lz)
-            amask_check_2 = attn_mask.shape == (bs, self.config.n_head, lx, lz)
-            assert amask_check_1 or amask_check_2
-
-        qq = rearrange(self.w_q(x), "bs lx (nh da) -> bs nh lx da", nh=self.config.n_head)
-        kk = rearrange(self.w_k(z), "bs lz (nh da) -> bs nh lz da", nh=self.config.n_head)
-        vv = rearrange(self.w_v(z), "bs lz (nh dm) -> bs nh lz dm", nh=self.config.n_head)
-
-        dropout_p = self.config.dropout if self.training else 0.0
-        y = F.scaled_dot_product_attention(
-            qq, kk, vv, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
-        )
-        y = rearrange(y, "bs nh lx dm -> bs lx (nh dm)")
-        y = self.output_dropout(self.w_o(y))
-
         return y
 
 
@@ -344,26 +287,39 @@ class LamoEncoder(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
 
-    def get_weight_decay_names(self):
-        return [
-            n for n, p in self.named_parameters()
-            if not (n.endswith("bias") or ".ln" in n)
-        ]
+    def get_should_decay_by_name(self):
 
-    def get_no_weight_decay_names(self):
-        return [
-            n for n, p in self.named_parameters()
-            if (n.endswith("bias") or ".ln" in n)
-        ]
+        def should_decay(name):
+            return not (
+                name.endswith("bias") or
+                (".ln" in name) or
+                ("wte" in name) or
+                ("wpe" in name)
+            )
+        return [(n, should_decay(n)) for n, p in self.named_parameters()]
 
     def get_optimizer_param_groups(self, weight_decay: float):
+
+        name_decay_bools = self.get_should_decay_by_name()
+        decay_names = set([n for n,b in name_decay_bools if b])
+        no_decay_names = set([n for n,b in name_decay_bools if not b])
+        all_names = set([n for n,p in self.named_parameters()])
+
+        # check we have every parameter in some group
+        chk1 = all_names - set.union(decay_names, no_decay_names)
+        assert len(chk1) == 0
+
+        # check no parameter is in both groups
+        chk2 = set.intersection(decay_names, no_decay_names)
+        assert len(chk2) == 0
+
         no_decay_params = [
             p for n, p in self.named_parameters()
-            if n in self.get_no_weight_decay_names()
+            if n in no_decay_names
         ]
         decay_params = [
             p for n, p in self.named_parameters()
-            if n in self.get_weight_decay_names()
+            if n in decay_names
         ]
         return [
             {'params': decay_params, 'weight_decay': weight_decay},
@@ -374,10 +330,8 @@ class LamoEncoder(nn.Module):
 
 if __name__ == "__main__":
 
-    d_e = 768
     n_head = 12
-    d_mid = d_e // n_head
-    d_attn = d_e // n_head
+    d_e = n_head * 64
     fc_mult = 4
     n_vocab = 2**15
     pre_layernorm = True
@@ -395,59 +349,5 @@ if __name__ == "__main__":
         bias=False,
         tie_weights=True,
     )
-
-    config_formal = FormalLamoConfig(
-        n_layer=12,
-        n_vocab=n_vocab,
-        n_head=n_head,
-        l_max=512,
-        d_x=d_e,
-        d_z=d_e,
-        d_attn=n_head * 4,
-        d_mid=n_head * 5,
-        d_out=n_head * 6,
-        fc_mult=fc_mult,
-        pre_layernorm=pre_layernorm,
-        padding_idx=0,
-        dropout=0.0,
-        bias=False,
-        tie_weights=True,
-    )
-
-
-    from data_mod import get_dataloaders
-    from flash_attn.bert_padding import unpad_input
-
-    dataloaders = get_dataloaders(32, 32)
-    train_dl = dataloaders['train_dl']
-    val_dl = dataloaders['val_dl']
-    batch = next(iter(train_dl))
     lamo = LamoEncoder(config)
 
-    hidden_states = lamo.encoder.wte(batch['input_ids'])
-    attn_mask = batch['attention_mask']
-
-    u_hidden_states, indices, cu_seqlens, max_seqlen_in_batch = unpad_input(hidden_states, attn_mask)
-
-    out = lamo(batch['input_ids'], batch['attention_mask'])
-
-    sys.exit(0)
-
-
-
-    mha = MultiheadAttention(config)
-    fmha = FormalMultiheadAttention(config_formal)
-
-    b_s = 3
-    l_x = config.l_max
-    l_z = config.l_max
-    x = torch.rand(b_s, l_x, config_formal.d_x)
-    z = torch.rand(b_s, l_z, config_formal.d_z)
-    mha_out = mha(x)
-    fmha_out = fmha(x, z)
-
-    input_ids = torch.randint(0, n_vocab, size=(b_s, l_x))
-    attention_mask = torch.ones_like(input_ids)
-    lamo = LamoEncoder(config)
-    rich.print("number of parameters: %.4fM" % (lamo.get_num_params() / 1e6,))
-    lamo_out = lamo(input_ids, attention_mask)
