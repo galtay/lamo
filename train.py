@@ -3,10 +3,6 @@ https://pytorch.org/blog/what-every-user-should-know-about-mixed-precision-train
 https://pytorch.org/docs/master/generated/torch.set_float32_matmul_precision.html?highlight=precision#torch.set_float32_matmul_precision
 https://pytorch.org/tutorials/recipes/recipes/amp_recipe.html
 
-
-
-TODO: checkpoints
-
 """
 
 import rich
